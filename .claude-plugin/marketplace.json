@@ -1,13 +1,13 @@
 {
   "name": "integral",
   "owner": { "name": "Serg Yalosovetsky" },
-  "metadata": { "description": "integral: one Claude Code mod above the prompt", "version": "0.1.0" },
+  "metadata": { "description": "integral: one Claude Code mod above the prompt", "version": "0.2.0" },
   "plugins": [
     {
       "name": "integral",
       "source": "./integral",
       "description": "Context fill by consumer, plan limits (5h / 7d) colored by pace, MCP servers that failed or need a login, and plan progress, in two or three rows above the prompt",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "category": "monitoring",
       "tags": ["context", "limits", "mcp", "plan", "mod"]
     }

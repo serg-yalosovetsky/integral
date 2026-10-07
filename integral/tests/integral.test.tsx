@@ -5,6 +5,7 @@ import { statusLayout } from '../hooks/layout'
 import { limitBars, paceColor } from '../hooks/limits'
 import { findUrl, fold, isIgnored, itemWidth, parseSearch, parseTools, problemsOf, reconnectName, shortName, summary } from '../hooks/mcp'
 import { addTask, fromTodos, planRow, progress, updateTask } from '../hooks/plan'
+import { checklist, epicRow, issueNumber, parseTask } from '../hooks/epic'
 import { CHECKPOINT_PROMPT } from '../hooks/register'
 
 const BAND = { component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 20, bodyColumns: 115 } }
@@ -70,7 +71,7 @@ const TOOLS_AUTH = [
   { name: 'mcp__plugin_acme_linear__authenticate', description: '', mcp: true },
 ]
 
-type World = { refuse?: string; breakdown: any; rateLimits: any[]; search: unknown; tools: unknown[]; now: number; authText: string; reconnectText: string }
+type World = { refuse?: string; breakdown: any; rateLimits: any[]; search: unknown; tools: unknown[]; now: number; authText: string; reconnectText: string; epics?: Record<number, string>; mcpFail?: '' | 'throw' | 'error' }
 
 // Stands for the engine beneath the mod; records what the mod asked of it.
 function engine(on: any, w: World, store: Record<string, unknown> = {}) {
@@ -100,13 +101,25 @@ function engine(on: any, w: World, store: Record<string, unknown> = {}) {
     if (e.tool === 'mcp__coord__coord_list') return { result: 'boom', text: 'boom', isError: true }
     if (e.tool === 'TodoWrite') return { result: { oldTodos: [], newTodos: e.todos }, text: 'ok' }
     if (e.tool === 'TaskCreate') return { result: { task: { id: String(++taskId), subject: e.subject } }, text: 'ok' }
+    if (e.tool === 'mcp__tasks__task_get') {
+      const text = w.epics?.[e.number] ?? '{"detail":"not found"}'
+      return { result: [{ type: 'text', text }], text }
+    }
+    if (e.tool === 'mcp__tasks__task_add') return { result: '{"n":2000}', text: '{"n":2000}' }
     if (e.tool === 'TaskUpdate') return { result: { success: true, taskId: e.taskId, updatedFields: ['status'] }, text: 'ok' }
     return { result: 'x', text: 'x' }
   })
   on('command.run', (_$: any, e: any) => (ran.push({ command: e.command, args: e.args }), { text: w.reconnectText }))
   on('prompt.submit', (_$: any, e: any) => (sent.push(e.text), { text: e.text }))
   on('ui.render', ($: any, e: any) => $.ui.resolve(e).Text({ children: 'band below' }))
-  return { store, ran, sent, toasts, logs, opened, called, clock }
+  const mcp: any[] = []
+  on('mcp.call', (_$: any, e: any) => {
+    mcp.push({ server: e.server, tool: e.tool, args: e.args })
+    if (w.mcpFail === 'throw') throw new Error('tasks down')
+    const text = w.mcpFail === 'error' ? 'Error: Forgejo 502' : (w.epics?.[e.args?.number] ?? '{"detail":"not found"}')
+    return { value: { content: [{ type: 'text', text }], isError: w.mcpFail === 'error' } }
+  })
+  return { store, ran, sent, toasts, logs, opened, called, clock, mcp }
 }
 
 const settle = () => new Promise(done => (globalThis as any).setTimeout(done, 20)) // background work at start
@@ -150,8 +163,8 @@ describe('integral: context (from context-bar-compact)', () => {
       const bar = row.bar.map(p => p.text).join('')
       expect(bar).toMatch(/^█+─+░*$/)
       expect(row.label).toBe('16%')
-      // bar + space + widest label + icons never run past the width
-      expect(bar.length + 1 + 'custom agents 0.5%'.length + 7).toBeLessThanOrEqual(inner + 4)
+      // bar + space + the current label + icons fill the width exactly, no gap left (Serg, 07.10)
+      expect(bar.length + 1 + row.label.length + 7).toBe(inner)
       expect(JSON.stringify(row)).not.toMatch(/k\/1M/)
     }
     const used = contextRow(toReading(SMALL), 115).bar.filter(p => p.text.startsWith('█')).map(p => p.color)
@@ -161,7 +174,7 @@ describe('integral: context (from context-bar-compact)', () => {
     expect(contextRow({ ...toReading(HOT), total: 900_000 }, 115).hot).toBe('error')
   })
 
-  test('the percentage cycles through consumers, biggest first, lighting each run; the bar keeps its width', () => {
+  test('the percentage cycles through consumers, biggest first, lighting each run; the row keeps the full width', () => {
     const r = toReading(BIG)
     expect(nextPick(r, null)).toBe('messages')
     expect(nextPick(r, 'messages')).toBe('system tools')
@@ -173,8 +186,10 @@ describe('integral: context (from context-bar-compact)', () => {
     expect(row.label).toBe(sliceLabel(r, r.slices.find(s => s.name === 'messages')!))
     expect(row.label).toBe('messages 40%')
     expect(row.bar.filter(p => p.text.startsWith('█') && !p.dim).length).toBe(1)
-    const width = (x: ReturnType<typeof contextRow>) => x.bar.reduce((n, p) => n + p.text.length, 0)
-    for (const name of seen) expect(width(contextRow(r, 115, name))).toBe(width(contextRow(r, 115)))
+    // the row stays exactly the width it was given whichever label shows: the bar gives way to a longer label
+    const width = (x: ReturnType<typeof contextRow>) => x.bar.reduce((n, p) => n + p.text.length, 0) + 1 + x.label.length + 7
+    for (const name of seen) expect(width(contextRow(r, 115, name))).toBe(115)
+    expect(width(contextRow(r, 115))).toBe(115)
   })
 
   test('mounted: row 1 has no k/1M, the three icons, and the percentage button', async ($, on) => {
@@ -486,6 +501,153 @@ describe('integral: plan', () => {
     await $.command.run({ command: 'integral', args: 'plan off' } as any)
     band = await mount($)
     expect(await band.find({ type: 'Text', text: '1/2' })).toBeUndefined()
+    await band.unmount()
+  })
+})
+
+// task_get's answers as the tracker gives them (serg/tasks#1556's shape).
+const item = (n: number, done: boolean) => `- [${done ? 'x' : ' '}] #${n} — task ${n}\n`
+const epicJson = (n: number, done: number, total: number, title = 'Claude Code mods: свой набор модов на ZenBook и затем по мешу', kind = 'epic') =>
+  JSON.stringify({ n, title, kind, status: 'todo', body: `Состав\n\n### Задачи\n\n${Array.from({ length: total }, (_, i) => item(1600 + i, i < done)).join('\n')}` })
+const EPICS: Record<number, string> = { 1556: epicJson(1556, 3, 11), 1700: epicJson(1700, 1, 4, 'Other epic'), 1590: epicJson(1590, 0, 0, 'A plain task', 'task'), 1800: epicJson(1800, 2, 2, 'Done epic') }
+
+describe('integral: plan from a tracker epic', () => {
+  test('body: done over all checklist items; no checklist or all done is no row', () => {
+    expect(checklist(JSON.parse(EPICS[1556]!).body)).toEqual({ done: 3, total: 11 })
+    expect(checklist('- [X] a\n  * [ ] b\nnot - [x] c\n- [] d')).toEqual({ done: 1, total: 2 })
+    expect(checklist('no list')).toEqual({ done: 0, total: 0 })
+    const info = parseTask(EPICS[1556]!)!
+    expect(info.n).toBe(1556)
+    expect(info.kind).toBe('epic')
+    expect(info.done).toBe(3)
+    expect(info.total).toBe(11)
+    expect(parseTask('Error: Forgejo 502')).toBeNull()
+    expect(issueNumber('#1556')).toBe(1556)
+    expect(issueNumber('abc')).toBeNull()
+    const ep = { n: 1556, isExplicit: false, title: info.title, done: 3, total: 11 }
+    expect(epicRow({ ...ep, done: 0, total: 0 }, 100)).toBeNull()
+    expect(epicRow({ ...ep, done: 11 }, 100)).toBeNull()
+    const row = epicRow(ep, 100)!
+    expect(row.count).toBe('3/11')
+    expect(row.ref).toBe('#1556')
+    expect(row.bar.map(p => p.text).join('')).toMatch(/^━+─+$/)
+    expect(row.bar[0]!.color).toBe('success')
+  })
+
+  test('the row never exceeds the width; a long title is cut with …', () => {
+    const ep = { n: 1556, isExplicit: false, title: 'x'.repeat(300), done: 3, total: 11 }
+    for (const inner of [20, 25, 40, 60, 80, 115, 200]) {
+      const row = epicRow(ep, inner)!
+      const drawn = row.mark.length + row.title.length + 2 + row.bar.reduce((n, p) => n + p.text.length, 0) + 1 + row.count.length + (row.ref ? 2 + row.ref.length : 0)
+      expect(drawn).toBe(row.cells)
+      expect(row.cells).toBeLessThanOrEqual(inner)
+    }
+    expect(epicRow(ep, 80)!.title.endsWith('…')).toBe(true)
+    expect(epicRow({ ...ep, title: 'short' }, 80)!.title).toBe('short')
+  })
+
+  test('auto: task_add with a parent sets the epic and fetches it; the row shows it', async ($, on) => {
+    const { mcp } = await started($, on, { epics: EPICS })
+    await $.tool.call({ tool: 'mcp__tasks__task_add', title: 'child', parent: 1556 } as any)
+    expect(mcp).toEqual([{ server: 'tasks', tool: 'task_get', args: { number: 1556, comments: 0 } }])
+    const band = await mount($)
+    expect(await band.find({ type: 'Text', text: '◆ ' })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: '3/11' })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: '#1556' })).toBeDefined()
+    await band.unmount()
+  })
+
+  test('auto: task_get of an epic sets it from the answer; of a task, or from a subagent, does not', async ($, on) => {
+    const { mcp } = await started($, on, { epics: EPICS })
+    await $.tool.call({ tool: 'mcp__tasks__task_get', number: 1700, agentId: 'a1' } as any)
+    await $.tool.call({ tool: 'mcp__tasks__task_get', number: 1590 } as any)
+    let band = await mount($)
+    expect(await band.find({ type: 'Text', text: '◆ ' })).toBeUndefined()
+    await band.unmount()
+    await $.tool.call({ tool: 'mcp__tasks__task_get', number: 1700 } as any)
+    expect(mcp.length).toBe(0) // the answer itself was enough
+    band = await mount($)
+    expect(await band.find({ type: 'Text', text: '1/4' })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: 'Other epic' })).toBeDefined()
+    await band.unmount()
+  })
+
+  test('/integral plan epic N is explicit: auto-detection does not override it; epic off clears', async ($, on) => {
+    await started($, on, { epics: EPICS })
+    expect((await $.command.run({ command: 'integral', args: 'plan epic 1556' } as any)).text).toMatch(/#1556 .*3\/11/)
+    await $.tool.call({ tool: 'mcp__tasks__task_get', number: 1700 } as any)
+    await $.tool.call({ tool: 'mcp__tasks__task_add', title: 'c', parent: 1700 } as any)
+    let band = await mount($)
+    expect(await band.find({ type: 'Text', text: '#1556' })).toBeDefined()
+    await band.unmount()
+    await $.command.run({ command: 'integral', args: 'plan epic off' } as any)
+    band = await mount($)
+    expect(await band.find({ type: 'Text', text: '◆ ' })).toBeUndefined()
+    await band.unmount()
+    // plan off hides the epic row too
+    await $.command.run({ command: 'integral', args: 'plan epic 1556' } as any)
+    await $.command.run({ command: 'integral', args: 'plan off' } as any)
+    band = await mount($)
+    expect(await band.find({ type: 'Text', text: '◆ ' })).toBeUndefined()
+    await band.unmount()
+  })
+
+  test('an epic with every item done draws no row', async ($, on) => {
+    await started($, on, { epics: EPICS })
+    await $.command.run({ command: 'integral', args: 'plan epic 1800' } as any)
+    const band = await mount($)
+    expect(await band.find({ type: 'Text', text: '◆ ' })).toBeUndefined()
+    await band.unmount()
+  })
+
+  test('an open todo plan comes before the epic', async ($, on) => {
+    await started($, on, { epics: EPICS })
+    await $.command.run({ command: 'integral', args: 'plan epic 1556' } as any)
+    await $.tool.call({ tool: 'TodoWrite', todos: seven(2) } as any)
+    let band = await mount($)
+    expect(await band.find({ type: 'Text', text: '2/7' })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: '3/11' })).toBeUndefined()
+    await band.unmount()
+    await $.tool.call({ tool: 'TodoWrite', todos: seven(7) } as any)
+    band = await mount($)
+    expect(await band.find({ type: 'Text', text: '3/11' })).toBeDefined()
+    await band.unmount()
+  })
+
+  test('a failing task_get is logged; the row keeps the last data and the band still draws', async ($, on) => {
+    const rec = await started($, on, { epics: EPICS })
+    await $.command.run({ command: 'integral', args: 'plan epic 1556' } as any)
+    rec.world.mcpFail = 'throw'
+    await $.tool.call({ tool: 'mcp__tasks__task_move', number: 1599, status: 'review' } as any)
+    await rec.clock.advance(5_000)
+    await settle()
+    rec.world.mcpFail = 'error'
+    await rec.clock.advance(120_000) // the two-minute tick refreshes too
+    await settle()
+    expect(rec.mcp.length).toBe(3)
+    // a throwing stub is skipped by the harness and the call rejects beneath it: the rejection is what is logged
+    expect(rec.logs.some(l => /integral: epic #1556 task_get: /.test(l))).toBe(true)
+    expect(rec.logs.some(l => /integral: epic #1556: task_get error/.test(l))).toBe(true)
+    const band = await mount($)
+    expect(await band.find({ type: 'Text', text: '3/11' })).toBeDefined()
+    expect(await band.find({ key: 'pct' })).toBeDefined()
+    await band.unmount()
+  })
+
+  test('a tracker call refreshes the epic once, 5 s after the burst', async ($, on) => {
+    const rec = await started($, on, { epics: EPICS })
+    await $.command.run({ command: 'integral', args: 'plan epic 1556' } as any)
+    expect(rec.mcp.length).toBe(1)
+    rec.world.epics = { ...EPICS, 1556: epicJson(1556, 4, 11) }
+    await $.tool.call({ tool: 'mcp__tasks__task_move', number: 1599, status: 'review' } as any)
+    await $.tool.call({ tool: 'mcp__tasks__task_note', number: 1599, text: 'x' } as any)
+    await rec.clock.advance(1_000)
+    expect(rec.mcp.length).toBe(1)
+    await rec.clock.advance(5_000)
+    await settle()
+    expect(rec.mcp.length).toBe(2)
+    const band = await mount($)
+    expect(await band.find({ type: 'Text', text: '4/11' })).toBeDefined()
     await band.unmount()
   })
 })

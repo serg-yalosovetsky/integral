@@ -34,6 +34,11 @@ export type Item = { id: string; title: string; active: string; status: ItemStat
 // The open plan: from TodoWrite (the whole list each call) or TaskCreate/TaskUpdate (one task a call).
 export type Board = { source: 'todo' | 'task'; items: Item[] }
 
+// The session's epic of the mesh tracker (MCP `tasks`): the plan row's second source.
+// `isExplicit`: set by /integral plan epic N, which auto-detection does not override.
+// title/done/total: the last task_get that answered; 0/0 until one has.
+export type Epic = { n: number; isExplicit: boolean; title: string; done: number; total: number }
+
 declare module 'claude-code' {
   interface PluginState {
     integral: {
@@ -49,6 +54,7 @@ declare module 'claude-code' {
       authOpened: string[]
       board: Board | null
       isPlanHidden: boolean
+      epic: Epic | null
     }
   }
 }

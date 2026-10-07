@@ -5,15 +5,19 @@
 //     unasked, is worse than a button that waits.
 //   Row 2, limits + MCP: the 5h and 7d bars (color = pace, Serg's rule), flush under row 1 thanks
 //     to top-aligned glyphs; MCP problems on the right with reconnect/auth buttons, the rest in +N.
-//   Row 3, plan: only while a task list is open, `● <current task>  ━━━──── 2/7`.
+//   Row 3, plan: only while a task list is open, `● <current task>  ━━━──── 2/7`. Without one,
+//     the session's tracker epic (MCP `tasks`): `◆ <title>  ━━━──── 3/11  #1556`, gone once all is [x].
+//     The epic: /integral plan epic N (off clears), else the last task_add's parent or task_get of an epic.
 //   Each section is built in its own try/catch: one that throws is logged and left out, the rest draw.
 //   /integral hides or shows it all (kept across sessions); /integral more | mcp | mcp check | plan off|on.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement, Timer } from 'claude-code'
 
-import type { Board, Limit, Reading, Report } from '../types'
+import type { Board, Epic, Limit, Reading, Report } from '../types'
 import { contextRow, legend, legendHead, legendParts, nextPick, toLimits, toReading } from './context'
 import type { Part } from './context'
+import { TASKS_PREFIX, TASKS_SERVER, epicRow, issueNumber, parseTask, textOf, withInfo } from './epic'
+import type { TaskInfo } from './epic'
 import { statusLayout } from './layout'
 import { MCP_COLOR, MCP_GLYPH, MCP_HEAD, findUrl, isRefusal, parseSearch, parseTools, problemsOf, reconnectName, shortName, summary } from './mcp'
 import type { Problem } from './mcp'
@@ -42,6 +46,7 @@ const startedAt = atom({ plugin: 'integral', key: 'startedAt' } as const, 0)
 const authOpened = atom({ plugin: 'integral', key: 'authOpened' } as const, [] as string[])
 const board = atom({ plugin: 'integral', key: 'board' } as const, null as Board | null)
 const isPlanHidden = atom({ plugin: 'integral', key: 'isPlanHidden' } as const, false)
+const epic = atom({ plugin: 'integral', key: 'epic' } as const, null as Epic | null)
 
 function errText(err: unknown) {
   return err instanceof Error ? err.message : String(err)
@@ -176,9 +181,82 @@ async function planFromCall($: EngineInterface, e: { tool: string; agentId?: str
   }
 }
 
+// ---------- epic (tracker) ----------
+
+let epicInflight: Promise<void> | undefined
+let epicScheduled = false
+
+// The epic's data from task_get. A failure is logged and the row keeps the last data it had.
+async function refreshEpic($: EngineInterface): Promise<void> {
+  if (epicInflight) return epicInflight
+  epicInflight = (async () => {
+    const cur = await read($, epic)
+    if (!cur) return
+    try {
+      const res = await $.mcp.call(TASKS_SERVER, 'task_get', { number: cur.n, comments: 0 })
+      const text = textOf(res.content)
+      const info = res.isError ? null : parseTask(text)
+      if (!info) {
+        $.ui.log(`${PLUGIN}: epic #${cur.n}: task_get ${res.isError ? 'error' : 'unparsed'}: ${text.slice(0, 200)}`, { to: 'debug' })
+        return
+      }
+      await update($, epic, e => (e && e.n === info.n ? withInfo(e, info) : e)) // switched meanwhile: that one fetches its own
+    } catch (err) {
+      trace($, `epic #${cur.n} task_get`, err) // the row keeps the last data
+    }
+  })().finally(() => {
+    epicInflight = undefined
+  })
+  return epicInflight
+}
+
+// Sets the session's epic; an explicit one (the command) is not replaced by a detected one.
+async function setEpic($: EngineInterface, n: number, isExplicit: boolean, info?: TaskInfo) {
+  let changed = false
+  await update($, epic, cur => {
+    if (cur && cur.isExplicit && !isExplicit) return cur
+    changed = true
+    const base: Epic = cur && cur.n === n ? { ...cur, isExplicit } : { n, isExplicit, title: '', done: 0, total: 0 }
+    return info && info.n === n ? withInfo(base, info) : base
+  })
+  if (changed && !info) await refreshEpic($)
+}
+
+// One refresh 5 s after a burst of tracker calls (a task moved, a checklist item ticked).
+function scheduleEpic($: EngineInterface) {
+  if (epicScheduled) return
+  epicScheduled = true
+  void (async () => {
+    try {
+      await $.clock.sleep(DEBOUNCE_MS)
+    } catch (err) {
+      trace($, 'epic debounce sleep', err) // no wait: the refresh runs now
+    }
+    epicScheduled = false
+    await refreshEpic($)
+  })().catch(err => trace($, 'epic refresh after tasks call', err))
+}
+
+// The main thread's tracker calls: task_add with a parent and task_get of an epic name the epic;
+// any other tracker call refreshes it (debounced).
+async function epicFromCall($: EngineInterface, e: { tool: string; agentId?: string }, ran: { deny?: string; isError?: boolean; text?: string; result?: unknown }) {
+  if (e.agentId !== undefined || !e.tool.startsWith(TASKS_PREFIX)) return
+  if (ran.deny !== undefined || ran.isError) return
+  const input = e as unknown as Record<string, unknown>
+  if (e.tool === `${TASKS_PREFIX}task_add`) {
+    const parent = issueNumber(input.parent)
+    const cur = await read($, epic)
+    if (parent !== null && (!cur || cur.n !== parent)) return setEpic($, parent, false)
+  } else if (e.tool === `${TASKS_PREFIX}task_get`) {
+    const info = parseTask(typeof ran.text === 'string' && ran.text ? ran.text : textOf(ran.result))
+    if (info && info.kind === 'epic') return setEpic($, info.n, false, info)
+  }
+  if (await read($, epic)) scheduleEpic($)
+}
+
 // ---------- the module ----------
 
-const HELP = '/integral: show or hide the HUD · more: full legend · mcp: MCP report · mcp check: recheck · plan off|on: the plan row'
+const HELP = '/integral: show or hide the HUD · more: full legend · mcp: MCP report · mcp check: recheck · plan off|on: the plan row · plan epic N|off: the tracker epic'
 
 export const register: Register = on => {
   let timer: Timer | undefined // one timer, even when session.start fires again on a reload
@@ -193,13 +271,16 @@ export const register: Register = on => {
       let n = 0
       timer = $.clock.every(TICK_MS, () => {
         void update($, tick, k => k + 1).catch(err => trace($, 'tick', err))
-        if (++n % MCP_EVERY === 0) void check($)
+        if (++n % MCP_EVERY === 0) {
+          void check($)
+          void refreshEpic($)
+        }
       })
     } catch (err) {
       trace($, 'clock.every', err) // no timer: limits move on with each response, MCP is checked at start, after MCP errors and on /integral mcp check
     }
     // A name Claude Code already has is refused: the HUD still works, only the command is missing.
-    await $.command.register({ name: 'integral', description: 'HUD: show/hide; more | mcp | mcp check | plan off|on' }).catch(err => trace($, 'command.register', err))
+    await $.command.register({ name: 'integral', description: 'HUD: show/hide; more | mcp | mcp check | plan off|on | plan epic N|off' }).catch(err => trace($, 'command.register', err))
     const hidden = (await $.store.get('isHidden').catch(err => (trace($, 'store.get isHidden', err), undefined))) === true
     await update($, isHidden, () => hidden)
     const planHidden = (await $.store.get('isPlanHidden').catch(err => (trace($, 'store.get isPlanHidden', err), undefined))) === true
@@ -253,12 +334,17 @@ export const register: Register = on => {
     } catch (err) {
       trace($, `plan from ${String(e.tool)}`, err) // the plan row keeps its last state
     }
+    try {
+      await epicFromCall($, e as never, res as never)
+    } catch (err) {
+      trace($, `epic from ${String(e.tool)}`, err) // the epic stays as it was
+    }
     return res
   })
 
   on('command.run', { command: 'integral' }, async ($, e) => {
     const args = e.args.trim().toLowerCase().split(/\s+/).filter(Boolean)
-    const [cmd, arg] = args
+    const [cmd, arg, arg2] = args
     if (!cmd) {
       const hidden = await update($, isHidden, h => !h)
       await $.store.set('isHidden', hidden).catch(err => trace($, 'store.set isHidden', err))
@@ -280,6 +366,17 @@ export const register: Register = on => {
       await update($, isPlanHidden, () => off)
       await $.store.set('isPlanHidden', off).catch(err => trace($, 'store.set isPlanHidden', err))
       return { text: off ? 'integral: plan row hidden' : 'integral: plan row on' }
+    }
+    if (cmd === 'plan' && arg === 'epic') {
+      if (arg2 === 'off') {
+        await update($, epic, () => null)
+        return { text: 'integral: epic cleared; task_add with a parent or task_get of an epic sets one again' }
+      }
+      const n = issueNumber(arg2)
+      if (n === null) return { text: 'integral: /integral plan epic <N> | off' }
+      await setEpic($, n, true)
+      const cur = await read($, epic)
+      return { text: cur && cur.total > 0 ? `integral: epic #${n} — ${cur.title} (${cur.done}/${cur.total})` : `integral: epic #${n}, no data yet (see claude --debug if it stays so)` }
     }
     return { text: HELP }
   })
@@ -387,10 +484,12 @@ export const register: Register = on => {
       trace($, 'render legend', err)
     }
 
-    // Row 3: plan.
+    // Row 3: plan. An open task list first, else the epic.
+    let hasPlan = false
     try {
       const b = await read($, board)
       if (b && !(await read($, isPlanHidden))) {
+        hasPlan = true
         const p = planRow(b, inner)
         rows.push(
           <Box flexDirection="row">
@@ -411,6 +510,31 @@ export const register: Register = on => {
       }
     } catch (err) {
       trace($, 'render plan', err)
+    }
+    try {
+      const ep = await read($, epic)
+      const p = !hasPlan && ep && !(await read($, isPlanHidden)) ? epicRow(ep, inner) : null
+      if (p) {
+        rows.push(
+          <Box flexDirection="row">
+            <Text>{p.mark}</Text>
+            <Text>{p.title}</Text>
+            <Box flexShrink={0} marginLeft={2}>
+              <Text>{line(p.bar)}</Text>
+            </Box>
+            <Box flexShrink={0} marginLeft={1}>
+              <Text>{p.count}</Text>
+            </Box>
+            {p.ref && (
+              <Box flexShrink={0} marginLeft={2}>
+                <Text dimColor>{p.ref}</Text>
+              </Box>
+            )}
+          </Box>,
+        )
+      }
+    } catch (err) {
+      trace($, 'render epic', err)
     }
 
     if (rows.length === 0) return rest

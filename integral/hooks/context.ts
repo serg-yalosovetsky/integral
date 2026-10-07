@@ -69,13 +69,13 @@ export function levelColor(r: Reading) {
 }
 
 // Row 1: the bar on the rest of the width, the percentage (pressable), then the three icons.
-// No `370k/1M` text (Serg, 07.10). The bar keeps its width whichever label the percentage shows.
+// No `370k/1M` text (Serg, 07.10). The bar takes all the room the current label leaves.
 export function contextRow(r: Reading, inner: number, pick: string | null = null): ContextRow {
   const level = levelColor(r)
   const chosen = pick ? r.slices.find(s => s.name === pick) : undefined
   const total = `${r.percent}%`
   const label = chosen ? sliceLabel(r, chosen) : total
-  const width = Math.max(4, inner - 1 - labelRoom(r) - ICONS_WIDTH)
+  const width = Math.max(4, inner - 1 - label.length - ICONS_WIDTH) // the bar fills the row; it shortens while a long consumer label shows (Serg, 07.10: use the whole width)
   const bar = cells(r, width).map(c => ({ text: c.text, color: c.color, dim: !!chosen && c.name !== chosen.name }))
   const ratio = r.compactsAt ? r.total / r.compactsAt : r.total / r.window
   return { bar, label, level, hot: ratio >= WARN_AT ? level : undefined }
