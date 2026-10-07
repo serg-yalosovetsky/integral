@@ -1,0 +1,9 @@
+{
+  "name": "integral",
+  "version": "0.1.0",
+  "description": "One HUD above the prompt: context bar with compact/checkpoint, plan limits, MCP health, plan progress. Replaces context-bar-compact and mcp-doctor.",
+  "author": {
+    "name": "Serg"
+  },
+  "types": "./types/index.d.ts"
+}
