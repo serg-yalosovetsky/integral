@@ -55,6 +55,7 @@ declare module 'claude-code' {
       board: Board | null
       isPlanHidden: boolean
       epic: Epic | null
+      preshow: string[] | null // the `[Image #N]` placeholders of the current draft, in order
     }
   }
 }

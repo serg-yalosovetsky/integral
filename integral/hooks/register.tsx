@@ -9,6 +9,8 @@
 //     the session's tracker epic (MCP `tasks`): `◆ <title>  ━━━──── 3/11  #1556`, gone once all is [x].
 //     The epic: /integral plan epic N (off clears), else the last task_add's parent or task_get of an epic.
 //   Each section is built in its own try/catch: one that throws is logged and left out, the rest draw.
+//   Row 4, preshow: the draft's pasted images, `▣ [Image #1] [Image #2]` (+N when cut) — the
+//     placeholders the text holds until submit, gone once the draft is empty again.
 //   /integral hides or shows it all (kept across sessions); /integral more | mcp | mcp check | plan off|on.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderElement, Timer } from 'claude-code'
@@ -22,6 +24,7 @@ import { statusLayout } from './layout'
 import { MCP_COLOR, MCP_GLYPH, MCP_HEAD, findUrl, isRefusal, parseSearch, parseTools, problemsOf, reconnectName, shortName, summary } from './mcp'
 import type { Problem } from './mcp'
 import { PLAN_TOOLS, addTask, fromTodos, planRow, updateTask } from './plan'
+import { imagesOf, preshowRow } from './preshow'
 
 const PLUGIN = 'integral'
 const MIN_WIDTH = 20 // narrower than this, nothing is drawn
@@ -47,6 +50,7 @@ const authOpened = atom({ plugin: 'integral', key: 'authOpened' } as const, [] a
 const board = atom({ plugin: 'integral', key: 'board' } as const, null as Board | null)
 const isPlanHidden = atom({ plugin: 'integral', key: 'isPlanHidden' } as const, false)
 const epic = atom({ plugin: 'integral', key: 'epic' } as const, null as Epic | null)
+const preshow = atom({ plugin: 'integral', key: 'preshow' } as const, null as string[] | null)
 
 function errText(err: unknown) {
   return err instanceof Error ? err.message : String(err)
@@ -254,6 +258,27 @@ async function epicFromCall($: EngineInterface, e: { tool: string; agentId?: str
   if (await read($, epic)) scheduleEpic($)
 }
 
+// ---------- preshow ----------
+
+// Recomputes the preshow from a draft; the atom changes only when the set of images does,
+// so typing without a paste or an erase does not redraw the band (serg/tasks#1955).
+async function syncPreshow($: EngineInterface, draft: unknown) {
+  const next = imagesOf(draft)
+  const cur = await read($, preshow)
+  if (cur && cur.length === next.length && cur.every((v, i) => v === next[i])) return
+  await update($, preshow, () => next)
+}
+
+// A resume or a reload can land on a draft that already holds images; seed from it once.
+async function seedPreshow($: EngineInterface) {
+  try {
+    const box = await $.prompt.read()
+    await syncPreshow($, (box as { text?: unknown }).text)
+  } catch (err) {
+    trace($, 'preshow seed', err)
+  }
+}
+
 // ---------- the module ----------
 
 const HELP = '/integral: show or hide the HUD · more: full legend · mcp: MCP report · mcp check: recheck · plan off|on: the plan row · plan epic N|off: the tracker epic'
@@ -287,6 +312,7 @@ export const register: Register = on => {
     await update($, isPlanHidden, () => planHidden)
     void refresh($).catch(err => trace($, 'refresh at start', err))
     void check($) // never holds the session's start; errors are traced inside
+    void seedPreshow($)
     return r
   })
 
@@ -340,6 +366,28 @@ export const register: Register = on => {
       trace($, `epic from ${String(e.tool)}`, err) // the epic stays as it was
     }
     return res
+  })
+
+  // The draft is the preshow's only source: a human edit and the engine's own change to the
+  // text (paste placeholder, /clear) both recompute it; the set, not each keystroke, redraws.
+  on('prompt.edit', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      await syncPreshow($, e.text)
+    } catch (err) {
+      trace($, 'preshow from edit', err)
+    }
+    return r
+  })
+
+  on('prompt.change', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      await syncPreshow($, e.text)
+    } catch (err) {
+      trace($, 'preshow from change', err)
+    }
+    return r
   })
 
   on('command.run', { command: 'integral' }, async ($, e) => {
@@ -535,6 +583,25 @@ export const register: Register = on => {
       }
     } catch (err) {
       trace($, 'render epic', err)
+    }
+
+    // The draft's pasted images, the row closest to the prompt (serg/tasks#1955).
+    try {
+      const p = preshowRow((await read($, preshow)) ?? [], inner)
+      if (p) {
+        rows.push(
+          <Box flexDirection="row">
+            <Box flexShrink={0}>
+              <Text dimColor>{p.mark}</Text>
+            </Box>
+            <Box flexShrink={1}>
+              <Text wrap="truncate-end">{line(p.parts)}</Text>
+            </Box>
+          </Box>,
+        )
+      }
+    } catch (err) {
+      trace($, 'render preshow', err)
     }
 
     if (rows.length === 0) return rest

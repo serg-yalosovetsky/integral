@@ -6,6 +6,7 @@ import { limitBars, paceColor } from '../hooks/limits'
 import { findUrl, fold, isIgnored, itemWidth, parseSearch, parseTools, problemsOf, reconnectName, shortName, summary } from '../hooks/mcp'
 import { addTask, fromTodos, planRow, progress, updateTask } from '../hooks/plan'
 import { checklist, epicRow, issueNumber, parseTask } from '../hooks/epic'
+import { imagesOf, preshowRow } from '../hooks/preshow'
 import { CHECKPOINT_PROMPT } from '../hooks/register'
 
 const BAND = { component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 20, bodyColumns: 115 } }
@@ -71,7 +72,7 @@ const TOOLS_AUTH = [
   { name: 'mcp__plugin_acme_linear__authenticate', description: '', mcp: true },
 ]
 
-type World = { refuse?: string; breakdown: any; rateLimits: any[]; search: unknown; tools: unknown[]; now: number; authText: string; reconnectText: string; epics?: Record<number, string>; mcpFail?: '' | 'throw' | 'error' }
+type World = { refuse?: string; breakdown: any; rateLimits: any[]; search: unknown; tools: unknown[]; now: number; authText: string; reconnectText: string; epics?: Record<number, string>; mcpFail?: '' | 'throw' | 'error'; draft?: string }
 
 // Stands for the engine beneath the mod; records what the mod asked of it.
 function engine(on: any, w: World, store: Record<string, unknown> = {}) {
@@ -111,6 +112,9 @@ function engine(on: any, w: World, store: Record<string, unknown> = {}) {
   })
   on('command.run', (_$: any, e: any) => (ran.push({ command: e.command, args: e.args }), { text: w.reconnectText }))
   on('prompt.submit', (_$: any, e: any) => (sent.push(e.text), { text: e.text }))
+  on('prompt.read', (_$: any, _e: any) => ({ value: { text: w.draft ?? '', cursor: 0 } }))
+  on('prompt.edit', (_$: any, e: any) => ({ text: e.text, cursor: e.cursor ?? 0 }))
+  on('prompt.change', (_$: any, e: any) => ({ text: e.text, cursor: e.cursor ?? 0 }))
   on('ui.render', ($: any, e: any) => $.ui.resolve(e).Text({ children: 'band below' }))
   const mcp: any[] = []
   on('mcp.call', (_$: any, e: any) => {
@@ -648,6 +652,50 @@ describe('integral: plan from a tracker epic', () => {
     expect(rec.mcp.length).toBe(2)
     const band = await mount($)
     expect(await band.find({ type: 'Text', text: '4/11' })).toBeDefined()
+    await band.unmount()
+  })
+})
+
+describe('integral: preshow of pasted images (serg/tasks#1955)', () => {
+  test('helpers: the placeholders of a draft; the row fits the width', () => {
+    expect(imagesOf('look [Image #1] then [Image #2]')).toEqual(['[Image #1]', '[Image #2]'])
+    expect(imagesOf('plain words')).toEqual([])
+    expect(imagesOf(undefined)).toEqual([])
+    expect(imagesOf(null)).toEqual([])
+    expect(imagesOf('twice [Image #3] and [Image #3]')).toEqual(['[Image #3]', '[Image #3]'])
+    expect(preshowRow([], 40)).toBeNull()
+    expect(preshowRow(['[Image #1]'], 40)?.parts).toEqual([{ text: '[Image #1]' }])
+    expect(preshowRow(['[Image #1]'], 4)).toBeNull() // narrower than the mark and one placeholder
+    const row = preshowRow(['[Image #1]', '[Image #2]', '[Image #3]'], 30)
+    expect(row?.mark).toBe('▣ ')
+    expect(row?.parts).toEqual([{ text: '[Image #1] [Image #2]' }, { text: ' +1', dim: true }])
+    expect(preshowRow(['[Image #1]', '[Image #2]'], 40)?.parts).toEqual([{ text: '[Image #1] [Image #2]' }])
+  })
+
+  test('mounted: the row follows the draft and clears with it', async ($, on) => {
+    await started($, on, {})
+    await $.prompt.edit({ text: 'look [Image #1]', inputText: '', cursor: 14, start: 14, end: 14 } as any)
+    let band = await mount($)
+    expect(await band.find({ type: 'Text', text: '▣ ' })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: '[Image #1]' })).toBeDefined()
+    await band.unmount()
+
+    await $.prompt.edit({ text: 'look [Image #1] and [Image #2]', inputText: '', cursor: 29, start: 29, end: 29 } as any)
+    band = await mount($)
+    expect(await band.find({ type: 'Text', text: '[Image #2]' })).toBeDefined()
+    await band.unmount()
+
+    // the engine's own change to the draft (a paste, /clear) recomputes too
+    await $.prompt.change({ text: '', inputText: '', cursor: 0, start: 0, end: 0 } as any)
+    band = await mount($)
+    expect(await band.find({ type: 'Text', text: '▣ ' })).toBeUndefined()
+    await band.unmount()
+  })
+
+  test('mounted: a draft that already holds images on start seeds the row', async ($, on) => {
+    await started($, on, { draft: 'resume with [Image #7] already here' })
+    const band = await mount($)
+    expect(await band.find({ type: 'Text', text: '[Image #7]' })).toBeDefined()
     await band.unmount()
   })
 })
